@@ -278,7 +278,7 @@ func TestParse(t *testing.T) {
 				remoteRepos = []string{ts.URL}
 			}
 
-			p := newParser(tt.inputFile)
+			p := NewParser(tt.inputFile)
 			p.remoteRepositories = remoteRepos
 
 			got, err := p.Parse(f)

@@ -29,7 +29,7 @@ type parser struct {
 	remoteRepositories []string
 }
 
-func newParser(filePath string) *parser {
+func NewParser(filePath string) *parser {
 	s := readSettings()
 	localRepository := s.LocalRepository
 	if localRepository == "" {
