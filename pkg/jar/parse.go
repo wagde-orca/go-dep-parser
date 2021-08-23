@@ -11,6 +11,7 @@ import (
 	"io"
 	"io/ioutil"
 	"net/http"
+	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -36,6 +37,7 @@ var (
 	jarFileRegEx = regexp.MustCompile(`^([a-zA-Z0-9\._-]*[^-*])-(\d\S*(?:-SNAPSHOT)?).jar$`)
 
 	ArtifactNotFoundErr = xerrors.New("no artifact found")
+	FailedSearchSHA1    = xerrors.New("failed to search by SHA1")
 )
 
 type conf struct {
@@ -69,8 +71,8 @@ func Parse(r io.Reader, opts ...Option) ([]types.Library, error) {
 	retryClient := retryablehttp.NewClient()
 	retryClient.Logger = logger{}
 	retryClient.RetryWaitMin = 20 * time.Second
-	retryClient.RetryWaitMax = 5 * time.Minute
-	retryClient.RetryMax = 5
+	retryClient.RetryWaitMax = 0 * time.Minute
+	retryClient.RetryMax = 0
 	client := retryClient.StandardClient()
 
 	c := conf{
@@ -81,13 +83,17 @@ func Parse(r io.Reader, opts ...Option) ([]types.Library, error) {
 		opt(&c)
 	}
 
-	return parseArtifact(c, c.rootFilePath, ioutil.NopCloser(r))
+	ret, err := parseArtifact(c, c.rootFilePath, filepath.Base(c.rootFilePath), ioutil.NopCloser(r))
+	log.Logger.Debugf("Parse returing %v %s %w", ret, err)
+	return ret, err
 }
 
-func parseArtifact(c conf, fileName string, r io.ReadCloser) ([]types.Library, error) {
+func parseArtifact(c conf, fileName string, origFileName string, r io.ReadCloser) ([]types.Library, error) {
 	defer r.Close()
 
+	currDir, err := os.Getwd()
 	log.Logger.Debugw("Parsing Java artifacts...", zap.String("file", fileName))
+	log.Logger.Debugf("Parsing Java artifacts... %s %s", currDir, fileName)
 
 	b, err := ioutil.ReadAll(r)
 	if err != nil {
@@ -117,7 +123,7 @@ func parseArtifact(c conf, fileName string, r io.ReadCloser) ([]types.Library, e
 			libs = append(libs, props.library())
 
 			// Check if the pom.properties is for the original JAR/WAR/EAR
-			if fileProps.artifactID == props.artifactID && fileProps.version == props.version {
+			if fileProps.ArtifactID == props.ArtifactID && fileProps.Version == props.Version {
 				foundPomProps = true
 			}
 		case filepath.Base(fileInJar.Name) == "MANIFEST.MF":
@@ -132,11 +138,16 @@ func parseArtifact(c conf, fileName string, r io.ReadCloser) ([]types.Library, e
 			}
 
 			// parse jar/war/ear recursively
-			innerLibs, err := parseArtifact(c, fileInJar.Name, fr)
+			innerLibs, err := parseArtifact(c, fileInJar.Name, origFileName, fr)
 			if err != nil {
+				if xerrors.Is(err, FailedSearchSHA1) {
+					log.Logger.Debugf("WAGDE failed to get sha1 for %s", fileInJar.Name)
+					continue
+				}
 				return nil, xerrors.Errorf("failed to parse %s: %w", fileInJar.Name, err)
 			}
 			libs = append(libs, innerLibs...)
+			// log.Logger.Debugf("WAGDE parseArtifact retuned: %v", libs)
 		}
 	}
 
@@ -146,6 +157,7 @@ func parseArtifact(c conf, fileName string, r io.ReadCloser) ([]types.Library, e
 	}
 
 	manifestProps := m.properties()
+
 	if manifestProps.valid() {
 		// Even if MANIFEST.MF is found, the groupId and artifactId might not be valid.
 		// We have to make sure that the artifact exists actually.
@@ -155,24 +167,40 @@ func parseArtifact(c conf, fileName string, r io.ReadCloser) ([]types.Library, e
 		}
 	}
 
-	// If groupId and artifactId are not found, call Maven Central's search API with SHA-1 digest.
-	p, err := searchBySHA1(c, b)
+	mVer, err := m.determineVersion()
 	if err == nil {
+		log.Logger.Debugf("WAGDE XXX found manifest file -%s-%s-%s-", fileName, origFileName, mVer)
+		if fileName == origFileName {
+			lib := types.Library{
+				Name:    fmt.Sprintf("ORCA:%s", origFileName),
+				Version: mVer}
+			libs = append(libs, lib)
+		}
+	}
+
+	// WAGE TODO REMOVE WAGDE DEBUGS
+	// If groupId and artifactId are not found, call Maven Central's search API with SHA-1 digest.
+	p, err := searchBySHA1(c, b, fileName)
+	if err == nil {
+		log.Logger.Debugf("WAGDE searchBySHA1 for eturned %v", p)
+		log.Logger.Debug("WAGDE 8")
 		return append(libs, p.library()), nil
 	} else if !xerrors.Is(err, ArtifactNotFoundErr) {
-		return nil, xerrors.Errorf("failed to search by SHA1: %w", err)
+		log.Logger.Debugf("WAGDE searchBySHA1 failed")
+		log.Logger.Debugf("WAGDE 10 %v", libs)
+		return libs, nil
 	}
 
 	log.Logger.Debugw("No such POM in the central repositories", zap.String("file", fileName))
 
 	// Return when artifactId or version from the file name are empty
-	if fileProps.artifactID == "" || fileProps.version == "" {
+	if fileProps.ArtifactID == "" || fileProps.Version == "" {
 		return libs, nil
 	}
 
 	// Try to search groupId by artifactId via sonatype API
 	// When some artifacts have the same groupIds, it might result in false detection.
-	fileProps.groupID, err = searchByArtifactID(c, fileProps.artifactID)
+	fileProps.GroupID, err = searchByArtifactID(c, fileProps.ArtifactID)
 	if err == nil {
 		log.Logger.Debugw("POM was determined in a heuristic way", zap.String("file", fileName),
 			zap.String("artifact", fileProps.String()))
@@ -180,7 +208,6 @@ func parseArtifact(c conf, fileName string, r io.ReadCloser) ([]types.Library, e
 	} else if !xerrors.Is(err, ArtifactNotFoundErr) {
 		return nil, xerrors.Errorf("failed to search by artifact id: %w", err)
 	}
-
 	return libs, nil
 }
 
@@ -199,15 +226,15 @@ func parseFileName(fileName string) properties {
 	}
 
 	return properties{
-		artifactID: packageVersion[1],
-		version:    packageVersion[2],
+		ArtifactID: packageVersion[1],
+		Version:    packageVersion[2],
 	}
 }
 
 type properties struct {
-	groupID    string
-	artifactID string
-	version    string
+	GroupID    string
+	ArtifactID string
+	Version    string
 }
 
 func parsePomProperties(f *zip.File) (properties, error) {
@@ -223,11 +250,11 @@ func parsePomProperties(f *zip.File) (properties, error) {
 		line := strings.TrimSpace(scanner.Text())
 		switch {
 		case strings.HasPrefix(line, "groupId="):
-			p.groupID = strings.TrimPrefix(line, "groupId=")
+			p.GroupID = strings.TrimPrefix(line, "groupId=")
 		case strings.HasPrefix(line, "artifactId="):
-			p.artifactID = strings.TrimPrefix(line, "artifactId=")
+			p.ArtifactID = strings.TrimPrefix(line, "artifactId=")
 		case strings.HasPrefix(line, "version="):
-			p.version = strings.TrimPrefix(line, "version=")
+			p.Version = strings.TrimPrefix(line, "version=")
 		}
 	}
 
@@ -239,17 +266,17 @@ func parsePomProperties(f *zip.File) (properties, error) {
 
 func (p properties) library() types.Library {
 	return types.Library{
-		Name:    fmt.Sprintf("%s:%s", p.groupID, p.artifactID),
-		Version: p.version,
+		Name:    fmt.Sprintf("%s:%s", p.GroupID, p.ArtifactID),
+		Version: p.Version,
 	}
 }
 
 func (p properties) valid() bool {
-	return p.groupID != "" && p.artifactID != "" && p.version != ""
+	return p.GroupID != "" && p.ArtifactID != "" && p.Version != ""
 }
 
 func (p properties) String() string {
-	return fmt.Sprintf("%s:%s:%s", p.groupID, p.artifactID, p.version)
+	return fmt.Sprintf("%s:%s:%s", p.GroupID, p.ArtifactID, p.Version)
 }
 
 type manifest struct {
@@ -340,9 +367,9 @@ func (m manifest) properties() properties {
 	}
 
 	return properties{
-		groupID:    groupID,
-		artifactID: artifactID,
-		version:    version,
+		GroupID:    groupID,
+		ArtifactID: artifactID,
+		Version:    version,
 	}
 }
 
@@ -402,7 +429,7 @@ func exists(c conf, p properties) (bool, error) {
 	}
 
 	q := req.URL.Query()
-	q.Set("q", fmt.Sprintf(idQuery, p.groupID, p.artifactID))
+	q.Set("q", fmt.Sprintf(idQuery, p.GroupID, p.ArtifactID))
 	q.Set("rows", "1")
 	req.URL.RawQuery = q.Encode()
 
@@ -419,14 +446,16 @@ func exists(c conf, p properties) (bool, error) {
 	return res.Response.NumFound > 0, nil
 }
 
-func searchBySHA1(c conf, data []byte) (properties, error) {
+type Sha1Cache map[string]properties
+
+func searchBySHA1(c conf, data []byte, fileName string) (properties, error) {
 	h := sha1.New()
 	_, err := h.Write(data)
 	if err != nil {
 		return properties{}, xerrors.Errorf("unable to calculate SHA-1: %w", err)
 	}
 	digest := hex.EncodeToString(h.Sum(nil))
-
+	log.Logger.Debugf("WAGDE check digest %s", digest)
 	req, err := http.NewRequest(http.MethodGet, c.baseURL, nil)
 	if err != nil {
 		return properties{}, xerrors.Errorf("unable to initialize HTTP client: %w", err)
@@ -437,10 +466,30 @@ func searchBySHA1(c conf, data []byte) (properties, error) {
 	q.Set("rows", "1")
 	q.Set("wt", "json")
 	req.URL.RawQuery = q.Encode()
-
+	log.Logger.Debugf("WAGDE query %s", req.URL.RawQuery)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return properties{}, xerrors.Errorf("sha1 search error: %w", err)
+		jsonFile, err := os.Open("./trivy_db/sha1Cache.json")
+		if err != nil {
+			return properties{}, xerrors.Errorf("cold not open cache file: %s", "./trivy_db/sha1Cache.json")
+		}
+		byteValue, _ := ioutil.ReadAll(jsonFile)
+		var sha1Cache Sha1Cache
+		err = json.Unmarshal(byteValue, &sha1Cache)
+		if err != nil {
+			return properties{}, xerrors.Errorf("failed to unmarshal cache json: %w", err)
+		}
+		// log.Logger.Debugf("WAGDE map %v", sha1Cache)
+		if val, ok := sha1Cache[digest]; ok {
+			log.Logger.Debugf("WAGDE digest %s in map %v", digest, val)
+			return val, nil
+		}
+		log.Logger.Debugf("Trivy: Digest not found for %s. digest to search: %s", fileName, digest)
+		return properties{
+			GroupID:    "NOT_FOUND_SHA1",
+			ArtifactID: fileName,
+			Version:    digest,
+		}, nil
 	}
 	defer resp.Body.Close()
 
@@ -464,11 +513,11 @@ func searchBySHA1(c conf, data []byte) (properties, error) {
 		return docs[i].ID < docs[j].ID
 	})
 	d := docs[0]
-
+	log.Logger.Debugf("WAGDE doc %s %s %s ...", d.GroupID, d.ArtifactID, d.Version)
 	return properties{
-		groupID:    d.GroupID,
-		artifactID: d.ArtifactID,
-		version:    d.Version,
+		GroupID:    d.GroupID,
+		ArtifactID: d.ArtifactID,
+		Version:    d.Version,
 	}, nil
 }
 
