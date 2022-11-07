@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -36,6 +37,7 @@ var (
 	jarFileRegEx = regexp.MustCompile(`^([a-zA-Z0-9\._-]*[^-*])-(\d\S*(?:-SNAPSHOT)?).jar$`)
 
 	ArtifactNotFoundErr = xerrors.New("no artifact found")
+	FailedSearchSHA1    = xerrors.New("failed to search by SHA1")
 )
 
 type Parser struct {
@@ -83,8 +85,8 @@ func NewParser(opts ...Option) types.Parser {
 	retryClient := retryablehttp.NewClient()
 	retryClient.Logger = logger{}
 	retryClient.RetryWaitMin = 20 * time.Second
-	retryClient.RetryWaitMax = 5 * time.Minute
-	retryClient.RetryMax = 5
+	retryClient.RetryWaitMax = 0 * time.Minute
+	retryClient.RetryMax = 0
 	client := retryClient.StandardClient()
 
 	// attempt to read the maven central api url from os environment, if it's
@@ -107,10 +109,10 @@ func NewParser(opts ...Option) types.Parser {
 }
 
 func (p *Parser) Parse(r dio.ReadSeekerAt) ([]types.Library, []types.Dependency, error) {
-	return p.parseArtifact(p.rootFilePath, p.size, r)
+	return p.parseArtifact(p.rootFilePath, filepath.Base(p.rootFilePath), p.size, r)
 }
 
-func (p *Parser) parseArtifact(fileName string, size int64, r dio.ReadSeekerAt) ([]types.Library, []types.Dependency, error) {
+func (p *Parser) parseArtifact(fileName string, origFileName string, size int64, r dio.ReadSeekerAt) ([]types.Library, []types.Dependency, error) {
 	log.Logger.Debugw("Parsing Java artifacts...", zap.String("file", fileName))
 
 	zr, err := zip.NewReader(r, size)
@@ -137,7 +139,7 @@ func (p *Parser) parseArtifact(fileName string, size int64, r dio.ReadSeekerAt) 
 			libs = append(libs, props.library())
 
 			// Check if the pom.properties is for the original JAR/WAR/EAR
-			if fileProps.artifactID == props.artifactID && fileProps.version == props.version {
+			if fileProps.ArtifactID == props.ArtifactID && fileProps.Version == props.Version {
 				foundPomProps = true
 			}
 		case filepath.Base(fileInJar.Name) == "MANIFEST.MF":
@@ -146,8 +148,11 @@ func (p *Parser) parseArtifact(fileName string, size int64, r dio.ReadSeekerAt) 
 				return nil, nil, xerrors.Errorf("failed to parse MANIFEST.MF: %w", err)
 			}
 		case isArtifact(fileInJar.Name):
-			innerLibs, _, err := p.parseInnerJar(fileInJar) //TODO process inner deps
+			innerLibs, _, err := p.parseInnerJar(fileInJar, origFileName) //TODO process inner deps
 			if err != nil {
+				if xerrors.Is(err, FailedSearchSHA1) {
+					continue
+				}
 				log.Logger.Debugf("Failed to parse %s: %s", fileInJar.Name, err)
 				continue
 			}
@@ -179,24 +184,34 @@ func (p *Parser) parseArtifact(fileName string, size int64, r dio.ReadSeekerAt) 
 		}
 	}
 
+	mVer, err := m.determineVersion()
+	if err == nil {
+		if fileName == origFileName {
+			lib := types.Library{
+				Name:    fmt.Sprintf("ORCA:%s", origFileName),
+				Version: mVer}
+			libs = append(libs, lib)
+		}
+	}
+
 	// If groupId and artifactId are not found, call Maven Central's search API with SHA-1 digest.
-	props, err := p.searchBySHA1(r)
+	props, err := p.searchBySHA1(r, fileName)
 	if err == nil {
 		return append(libs, props.library()), nil, nil
 	} else if !xerrors.Is(err, ArtifactNotFoundErr) {
-		return nil, nil, xerrors.Errorf("failed to search by SHA1: %w", err)
+		return libs, nil, nil
 	}
 
 	log.Logger.Debugw("No such POM in the central repositories", zap.String("file", fileName))
 
 	// Return when artifactId or version from the file name are empty
-	if fileProps.artifactID == "" || fileProps.version == "" {
+	if fileProps.ArtifactID == "" || fileProps.Version == "" {
 		return libs, nil, nil
 	}
 
 	// Try to search groupId by artifactId via sonatype API
 	// When some artifacts have the same groupIds, it might result in false detection.
-	fileProps.groupID, err = p.searchByArtifactID(fileProps.artifactID)
+	fileProps.GroupID, err = p.searchByArtifactID(fileProps.ArtifactID)
 	if err == nil {
 		log.Logger.Debugw("POM was determined in a heuristic way", zap.String("file", fileName),
 			zap.String("artifact", fileProps.String()))
@@ -208,7 +223,7 @@ func (p *Parser) parseArtifact(fileName string, size int64, r dio.ReadSeekerAt) 
 	return libs, nil, nil
 }
 
-func (p *Parser) parseInnerJar(zf *zip.File) ([]types.Library, []types.Dependency, error) {
+func (p *Parser) parseInnerJar(zf *zip.File, origFileName string) ([]types.Library, []types.Dependency, error) {
 	fr, err := zf.Open()
 	if err != nil {
 		return nil, nil, xerrors.Errorf("unable to open %s: %w", zf.Name, err)
@@ -229,7 +244,7 @@ func (p *Parser) parseInnerJar(zf *zip.File) ([]types.Library, []types.Dependenc
 	}
 
 	// Parse jar/war/ear recursively
-	innerLibs, innerDeps, err := p.parseArtifact(zf.Name, int64(zf.UncompressedSize64), f)
+	innerLibs, innerDeps, err := p.parseArtifact(zf.Name, origFileName, int64(zf.UncompressedSize64), f)
 	if err != nil {
 		return nil, nil, xerrors.Errorf("failed to parse %s: %w", zf.Name, err)
 	}
@@ -252,15 +267,15 @@ func parseFileName(fileName string) properties {
 	}
 
 	return properties{
-		artifactID: packageVersion[1],
-		version:    packageVersion[2],
+		ArtifactID: packageVersion[1],
+		Version:    packageVersion[2],
 	}
 }
 
 type properties struct {
-	groupID    string
-	artifactID string
-	version    string
+	GroupID    string
+	ArtifactID string
+	Version    string
 }
 
 func parsePomProperties(f *zip.File) (properties, error) {
@@ -276,11 +291,11 @@ func parsePomProperties(f *zip.File) (properties, error) {
 		line := strings.TrimSpace(scanner.Text())
 		switch {
 		case strings.HasPrefix(line, "groupId="):
-			p.groupID = strings.TrimPrefix(line, "groupId=")
+			p.GroupID = strings.TrimPrefix(line, "groupId=")
 		case strings.HasPrefix(line, "artifactId="):
-			p.artifactID = strings.TrimPrefix(line, "artifactId=")
+			p.ArtifactID = strings.TrimPrefix(line, "artifactId=")
 		case strings.HasPrefix(line, "version="):
-			p.version = strings.TrimPrefix(line, "version=")
+			p.Version = strings.TrimPrefix(line, "version=")
 		}
 	}
 
@@ -291,15 +306,15 @@ func parsePomProperties(f *zip.File) (properties, error) {
 }
 
 func (p properties) library() types.Library {
-	return types.Library{Name: fmt.Sprintf("%s:%s", p.groupID, p.artifactID), Version: p.version}
+	return types.Library{Name: fmt.Sprintf("%s:%s", p.GroupID, p.ArtifactID), Version: p.Version}
 }
 
 func (p properties) valid() bool {
-	return p.groupID != "" && p.artifactID != "" && p.version != ""
+	return p.GroupID != "" && p.ArtifactID != "" && p.Version != ""
 }
 
 func (p properties) String() string {
-	return fmt.Sprintf("%s:%s:%s", p.groupID, p.artifactID, p.version)
+	return fmt.Sprintf("%s:%s:%s", p.GroupID, p.ArtifactID, p.Version)
 }
 
 type manifest struct {
@@ -390,9 +405,9 @@ func (m manifest) properties() properties {
 	}
 
 	return properties{
-		groupID:    groupID,
-		artifactID: artifactID,
-		version:    version,
+		GroupID:    groupID,
+		ArtifactID: artifactID,
+		Version:    version,
 	}
 }
 
@@ -452,7 +467,7 @@ func (p *Parser) exists(props properties) (bool, error) {
 	}
 
 	q := req.URL.Query()
-	q.Set("q", fmt.Sprintf(idQuery, props.groupID, props.artifactID))
+	q.Set("q", fmt.Sprintf(idQuery, props.GroupID, props.ArtifactID))
 	q.Set("rows", "1")
 	req.URL.RawQuery = q.Encode()
 
@@ -469,7 +484,9 @@ func (p *Parser) exists(props properties) (bool, error) {
 	return res.Response.NumFound > 0, nil
 }
 
-func (p *Parser) searchBySHA1(r io.ReadSeeker) (properties, error) {
+type Sha1Cache map[string]properties
+
+func (p *Parser) searchBySHA1(r io.ReadSeeker, fileName string) (properties, error) {
 	if _, err := r.Seek(0, io.SeekStart); err != nil {
 		return properties{}, xerrors.Errorf("file seek error: %w", err)
 	}
@@ -493,7 +510,24 @@ func (p *Parser) searchBySHA1(r io.ReadSeeker) (properties, error) {
 
 	resp, err := p.httpClient.Do(req)
 	if err != nil {
-		return properties{}, xerrors.Errorf("sha1 search error: %w", err)
+		jsonFile, err := os.Open("./trivy_db/sha1Cache.json")
+		if err != nil {
+			return properties{}, xerrors.Errorf("cold not open cache file: %s", "./trivy_db/sha1Cache.json")
+		}
+		byteValue, _ := ioutil.ReadAll(jsonFile)
+		var sha1Cache Sha1Cache
+		err = json.Unmarshal(byteValue, &sha1Cache)
+		if err != nil {
+			return properties{}, xerrors.Errorf("failed to unmarshal cache json: %w", err)
+		}
+		if val, ok := sha1Cache[digest]; ok {
+			return val, nil
+		}
+		return properties{
+			GroupID:    "NOT_FOUND_SHA1",
+			ArtifactID: fileName,
+			Version:    digest,
+		}, nil
 	}
 	defer resp.Body.Close()
 
@@ -519,9 +553,9 @@ func (p *Parser) searchBySHA1(r io.ReadSeeker) (properties, error) {
 	d := docs[0]
 
 	return properties{
-		groupID:    d.GroupID,
-		artifactID: d.ArtifactID,
-		version:    d.Version,
+		GroupID:    d.GroupID,
+		ArtifactID: d.ArtifactID,
+		Version:    d.Version,
 	}, nil
 }
 
