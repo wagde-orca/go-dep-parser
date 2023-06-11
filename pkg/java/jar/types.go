@@ -2,6 +2,7 @@ package jar
 
 import (
 	"fmt"
+
 	"github.com/aquasecurity/go-dep-parser/pkg/types"
 	"golang.org/x/xerrors"
 )
@@ -14,10 +15,11 @@ type Properties struct {
 	Version    string
 }
 
-func (p Properties) Library() types.Library {
+func (p Properties) Library(fileName string) types.Library {
 	return types.Library{
-		Name:    fmt.Sprintf("%s:%s", p.GroupID, p.ArtifactID),
-		Version: p.Version,
+		Name:     fmt.Sprintf("%s:%s", p.GroupID, p.ArtifactID),
+		Version:  p.Version,
+		FileName: fileName,
 	}
 }
 

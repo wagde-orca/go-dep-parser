@@ -10,6 +10,7 @@ type Library struct {
 	License            string        `json:",omitempty"`
 	ExternalReferences []ExternalRef `json:",omitempty"`
 	Locations          []Location    `json:",omitempty"`
+	FileName           string        `json:",omitempty"`
 }
 
 // Location in lock file
